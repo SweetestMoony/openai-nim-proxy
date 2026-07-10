@@ -28,8 +28,7 @@ const MODEL_MAPPING = {
   'glm5': 'z-ai/glm-5.1',
   'glm52': 'z-ai/glm-5.2',
   'qwen': 'qwen/qwen3.5-397b-a17b',
-  'step': 'stepfun-ai/step-3.5-flash' 
-  'step37': 'stepfun-ai/step-3.7-flash'
+  'step': 'stepfun-ai/step-3.5-flash'
 };
 
 // Health check endpoint
