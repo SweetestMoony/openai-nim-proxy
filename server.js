@@ -29,6 +29,7 @@ const MODEL_MAPPING = {
   'llama3': 'meta/llama-3.3-70b-instruct',
   'llama4': 'meta/llama-4-maverick-17b-128e-instruct',
   'deep4': 'deepseek-ai/deepseek-v4-pro',
+  'deepfast': 'deepseek-ai/deepseek-v4-flash',
   'glm5': 'z-ai/glm-5.1',
   'glm52': 'z-ai/glm-5.2',
   'qwen': 'qwen/qwen3.5-397b-a17b',
