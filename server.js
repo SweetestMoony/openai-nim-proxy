@@ -34,6 +34,7 @@ const MODEL_MAPPING = {
   'glm52': 'z-ai/glm-5.2',
   'qwen': 'qwen/qwen3.5-397b-a17b',
   'step': 'stepfun-ai/step-3.5-flash'
+  'kimi': 'moonshotai/kimi-k2.6'
 };
 
 // Health check endpoint
