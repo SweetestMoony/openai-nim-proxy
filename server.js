@@ -24,6 +24,10 @@ const SHOW_REASONING = false; // Set to true to show reasoning with <think> tags
 // 🔥 THINKING MODE TOGGLE - Enables thinking for specific models that support it
 const ENABLE_THINKING_MODE = false; // Set to true to enable chat_template_kwargs thinking parameter
 
+// 🔧 FIX: timeout para chamadas à NIM API (evita requests pendurados indefinidamente
+// quando um modelo está sobrecarregado ou lento, ex: Deep4 Pro)
+const NIM_REQUEST_TIMEOUT = parseInt(process.env.NIM_REQUEST_TIMEOUT_MS || '120000', 10); // 120s default
+
 // Model mapping (adjust based on available NIM models)
 const MODEL_MAPPING = {
   'llama3': 'meta/llama-3.3-70b-instruct',
@@ -33,7 +37,7 @@ const MODEL_MAPPING = {
   'glm5': 'z-ai/glm-5.1',
   'glm52': 'z-ai/glm-5.2',
   'qwen': 'qwen/qwen3.5-397b-a17b',
-  'step': 'stepfun-ai/step-3.5-flash'
+  'step': 'stepfun-ai/step-3.5-flash',
   'kimi': 'moonshotai/kimi-k2.6'
 };
 
@@ -43,7 +47,8 @@ app.get('/health', (req, res) => {
     status: 'ok', 
     service: 'OpenAI to NVIDIA NIM Proxy', 
     reasoning_display: SHOW_REASONING,
-    thinking_mode: ENABLE_THINKING_MODE
+    thinking_mode: ENABLE_THINKING_MODE,
+    request_timeout_ms: NIM_REQUEST_TIMEOUT
   });
 });
 
@@ -71,19 +76,22 @@ app.post('/v1/chat/completions', async (req, res) => {
     let nimModel = MODEL_MAPPING[model];
     if (!nimModel) {
       try {
-        await axios.post(`${NIM_API_BASE}/chat/completions`, {
+        const testRes = await axios.post(`${NIM_API_BASE}/chat/completions`, {
           model: model,
           messages: [{ role: 'user', content: 'test' }],
           max_tokens: 1
         }, {
           headers: { 'Authorization': `Bearer ${NIM_API_KEY}`, 'Content-Type': 'application/json' },
-          validateStatus: (status) => status < 500
-        }).then(res => {
-          if (res.status >= 200 && res.status < 300) {
-            nimModel = model;
-          }
+          validateStatus: (status) => status < 500,
+          timeout: 15000 // teste rápido de fallback, não precisa do timeout longo
         });
-      } catch (e) {}
+        if (testRes.status >= 200 && testRes.status < 300) {
+          nimModel = model;
+        }
+      } catch (e) {
+        // 🔧 FIX: log do erro em vez de engolir silenciosamente
+        console.error('Fallback model test failed:', e.message);
+      }
       
       if (!nimModel) {
         const modelLower = model.toLowerCase();
@@ -118,7 +126,10 @@ app.post('/v1/chat/completions', async (req, res) => {
       // Sem isso, prompts grandes ou respostas longas do modelo podem
       // ser truncados ou lançar erro internamente.
       maxBodyLength: 64 * 1024 * 1024,      // 64MB
-      maxContentLength: 64 * 1024 * 1024    // 64MB
+      maxContentLength: 64 * 1024 * 1024,   // 64MB
+      // 🔧 FIX: sem timeout, um modelo lento/sobrecarregado (ex: Deep4 Pro)
+      // deixava o request pendurado indefinidamente.
+      timeout: NIM_REQUEST_TIMEOUT
     });
     
     if (stream) {
@@ -226,12 +237,18 @@ app.post('/v1/chat/completions', async (req, res) => {
     
   } catch (error) {
     console.error('Proxy error:', error.message);
-    
-    res.status(error.response?.status || 500).json({
+
+    // 🔧 FIX: identificar timeout explicitamente (antes caía tudo em 500 genérico)
+    const isTimeout = error.code === 'ECONNABORTED' || error.message?.includes('timeout');
+    const status = error.response?.status || (isTimeout ? 504 : 500);
+
+    res.status(status).json({
       error: {
-        message: error.message || 'Internal server error',
+        message: isTimeout
+          ? `Request to NIM API timed out after ${NIM_REQUEST_TIMEOUT}ms`
+          : (error.message || 'Internal server error'),
         type: 'invalid_request_error',
-        code: error.response?.status || 500
+        code: status
       }
     });
   }
@@ -253,4 +270,5 @@ app.listen(PORT, () => {
   console.log(`Health check: http://localhost:${PORT}/health`);
   console.log(`Reasoning display: ${SHOW_REASONING ? 'ENABLED' : 'DISABLED'}`);
   console.log(`Thinking mode: ${ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'}`);
+  console.log(`Request timeout: ${NIM_REQUEST_TIMEOUT}ms`);
 });
