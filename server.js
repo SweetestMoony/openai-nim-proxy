@@ -31,11 +31,8 @@ const NIM_REQUEST_TIMEOUT = parseInt(process.env.NIM_REQUEST_TIMEOUT_MS || '1200
 // Model mapping (adjust based on available NIM models)
 const MODEL_MAPPING = {
   'llama3': 'meta/llama-3.3-70b-instruct',
-  'llama4': 'meta/llama-4-maverick-17b-128e-instruct',
-  'deep4': 'deepseek-ai/deepseek-v4-pro',
-  'deepfast': 'deepseek-ai/deepseek-v4-flash',
-  'glm5': 'z-ai/glm-5.1',
-  'glm52': 'z-ai/glm-5.2',
+  'nemoultra': 'nvidia/nemotron-3-ultra-550b-a55b',
+  'deep4': 'deepseek-ai/deepseek-v4-flash-0731',
   'qwen': 'qwen/qwen3.5-397b-a17b',
   'step': 'stepfun-ai/step-3.7-flash',
   'nemotron': 'nvidia/nemotron-3-super-120b-a12b'
