@@ -31,7 +31,7 @@ const NIM_REQUEST_TIMEOUT = parseInt(process.env.NIM_REQUEST_TIMEOUT_MS || '1200
 // Model mapping (adjust based on available NIM models)
 const MODEL_MAPPING = {
   'llama3': 'meta/llama-3.3-70b-instruct',
-  'kimi': 'moonshotai/kimi-k3',
+  'k3': 'moonshotai/kimi-k3',
   'fast': 'deepseek-ai/deepseek-v4-flash-0731',
   'deep4': 'deepseek-ai/deepseek-v4-pro-0813',
   'step': 'stepfun-ai/step-3.7-flash',
