@@ -28,6 +28,11 @@ const ENABLE_THINKING_MODE = false; // Set to true to enable chat_template_kwarg
 // quando um modelo está sobrecarregado ou lento, ex: Deep4 Pro)
 const NIM_REQUEST_TIMEOUT = parseInt(process.env.NIM_REQUEST_TIMEOUT_MS || '120000', 10); // 120s default
 
+// 🆕 Configuração de retry para erros transitórios da NIM
+const NIM_MAX_RETRIES = parseInt(process.env.NIM_MAX_RETRIES || '3', 10);
+const NIM_RETRY_BASE_DELAY_MS = parseInt(process.env.NIM_RETRY_BASE_DELAY_MS || '1000', 10);
+const RETRYABLE_STATUSES = new Set([410, 429, 500, 502, 503, 504]);
+
 // Model mapping (adjust based on available NIM models)
 const MODEL_MAPPING = {
   'llama3': 'meta/llama-3.3-70b-instruct',
@@ -38,14 +43,90 @@ const MODEL_MAPPING = {
   'nemotron': 'nvidia/nemotron-3-super-120b-a12b'
 };
 
+// 🆕 Estado simples de saúde por modelo, só pra observabilidade via /health
+const modelHealth = {}; // { [nimModelId]: { failures: number, lastStatus: number|null, lastFailureAt: string|null } }
+
+function recordModelFailure(nimModelId, status) {
+  if (!modelHealth[nimModelId]) {
+    modelHealth[nimModelId] = { failures: 0, lastStatus: null, lastFailureAt: null };
+  }
+  modelHealth[nimModelId].failures += 1;
+  modelHealth[nimModelId].lastStatus = status;
+  modelHealth[nimModelId].lastFailureAt = new Date().toISOString();
+}
+
+function recordModelSuccess(nimModelId) {
+  if (modelHealth[nimModelId]) {
+    modelHealth[nimModelId].failures = 0;
+  }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// 🆕 Chamada à NIM API com retry/backoff para erros transitórios (410/429/5xx)
+async function callNimWithRetry(nimRequest, { stream }) {
+  const headers = {
+    Authorization: `Bearer ${NIM_API_KEY}`,
+    'Content-Type': 'application/json'
+  };
+
+  let lastError;
+
+  for (let attempt = 0; attempt <= NIM_MAX_RETRIES; attempt++) {
+    try {
+      const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
+        headers,
+        responseType: stream ? 'stream' : 'json',
+        // 🔧 FIX: por padrão o Axios limita o corpo enviado/recebido.
+        maxBodyLength: 64 * 1024 * 1024,
+        maxContentLength: 64 * 1024 * 1024,
+        timeout: NIM_REQUEST_TIMEOUT
+      });
+      recordModelSuccess(nimRequest.model);
+      return response;
+    } catch (error) {
+      lastError = error;
+      const status = error.response?.status;
+      recordModelFailure(nimRequest.model, status || 'network_error');
+
+      const isRetryable = status ? RETRYABLE_STATUSES.has(status) : true; // erro de rede/timeout também tenta de novo
+      const isLastAttempt = attempt === NIM_MAX_RETRIES;
+
+      console.error(
+        `NIM call failed (model=${nimRequest.model}, attempt=${attempt + 1}/${NIM_MAX_RETRIES + 1}, status=${status || 'n/a'}):`,
+        error.response?.data ? JSON.stringify(error.response.data) : error.message
+      );
+
+      if (!isRetryable || isLastAttempt) {
+        throw error;
+      }
+
+      const retryAfterHeader = error.response?.headers?.['retry-after'];
+      const backoff = retryAfterHeader
+        ? Number(retryAfterHeader) * 1000
+        : NIM_RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+      const jitter = Math.random() * 300;
+
+      console.warn(`Retentando em ${Math.round(backoff + jitter)}ms...`);
+      await sleep(backoff + jitter);
+    }
+  }
+
+  throw lastError;
+}
+
 // Health check endpoint
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    service: 'OpenAI to NVIDIA NIM Proxy', 
+  res.json({
+    status: 'ok',
+    service: 'OpenAI to NVIDIA NIM Proxy',
     reasoning_display: SHOW_REASONING,
     thinking_mode: ENABLE_THINKING_MODE,
-    request_timeout_ms: NIM_REQUEST_TIMEOUT
+    request_timeout_ms: NIM_REQUEST_TIMEOUT,
+    max_retries: NIM_MAX_RETRIES,
+    model_health: modelHealth
   });
 });
 
@@ -57,7 +138,7 @@ app.get('/v1/models', (req, res) => {
     created: Date.now(),
     owned_by: 'nvidia-nim-proxy'
   }));
-  
+
   res.json({
     object: 'list',
     data: models
@@ -68,7 +149,7 @@ app.get('/v1/models', (req, res) => {
 app.post('/v1/chat/completions', async (req, res) => {
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
-    
+
     // Smart model selection with fallback
     let nimModel = MODEL_MAPPING[model];
     if (!nimModel) {
@@ -86,10 +167,9 @@ app.post('/v1/chat/completions', async (req, res) => {
           nimModel = model;
         }
       } catch (e) {
-        // 🔧 FIX: log do erro em vez de engolir silenciosamente
         console.error('Fallback model test failed:', e.message);
       }
-      
+
       if (!nimModel) {
         const modelLower = model.toLowerCase();
         if (modelLower.includes('gpt-4') || modelLower.includes('claude-opus') || modelLower.includes('405b')) {
@@ -101,7 +181,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
       }
     }
-    
+
     // Transform OpenAI request to NIM format
     const nimRequest = {
       model: nimModel,
@@ -111,68 +191,54 @@ app.post('/v1/chat/completions', async (req, res) => {
       extra_body: ENABLE_THINKING_MODE ? { chat_template_kwargs: { thinking: true } } : undefined,
       stream: stream || false
     };
-    
-    // Make request to NVIDIA NIM API
-    const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
-      headers: {
-        'Authorization': `Bearer ${NIM_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      responseType: stream ? 'stream' : 'json',
-      // 🔧 FIX: por padrão o Axios limita o corpo enviado/recebido.
-      // Sem isso, prompts grandes ou respostas longas do modelo podem
-      // ser truncados ou lançar erro internamente.
-      maxBodyLength: 64 * 1024 * 1024,      // 64MB
-      maxContentLength: 64 * 1024 * 1024,   // 64MB
-      // 🔧 FIX: sem timeout, um modelo lento/sobrecarregado (ex: Deep4 Pro)
-      // deixava o request pendurado indefinidamente.
-      timeout: NIM_REQUEST_TIMEOUT
-    });
-    
+
+    // Faz a chamada com retry/backoff para erros transitórios (410/429/5xx)
+    const response = await callNimWithRetry(nimRequest, { stream: !!stream });
+
     if (stream) {
       // Handle streaming response with reasoning
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
-      
+
       let buffer = '';
       let reasoningStarted = false;
-      
+
       response.data.on('data', (chunk) => {
         buffer += chunk.toString();
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
-        
+
         lines.forEach(line => {
           if (line.startsWith('data: ')) {
             if (line.includes('[DONE]')) {
               res.write(line + '\n');
               return;
             }
-            
+
             try {
               const data = JSON.parse(line.slice(6));
               if (data.choices?.[0]?.delta) {
                 const reasoning = data.choices[0].delta.reasoning_content;
                 const content = data.choices[0].delta.content;
-                
+
                 if (SHOW_REASONING) {
                   let combinedContent = '';
-                  
+
                   if (reasoning && !reasoningStarted) {
                     combinedContent = '<think>\n' + reasoning;
                     reasoningStarted = true;
                   } else if (reasoning) {
                     combinedContent = reasoning;
                   }
-                  
+
                   if (content && reasoningStarted) {
                     combinedContent += '</think>\n\n' + content;
                     reasoningStarted = false;
                   } else if (content) {
                     combinedContent += content;
                   }
-                  
+
                   if (combinedContent) {
                     data.choices[0].delta.content = combinedContent;
                     delete data.choices[0].delta.reasoning_content;
@@ -193,7 +259,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           }
         });
       });
-      
+
       response.data.on('end', () => res.end());
       response.data.on('error', (err) => {
         console.error('Stream error:', err);
@@ -208,11 +274,11 @@ app.post('/v1/chat/completions', async (req, res) => {
         model: model,
         choices: response.data.choices.map(choice => {
           let fullContent = choice.message?.content || '';
-          
+
           if (SHOW_REASONING && choice.message?.reasoning_content) {
             fullContent = '<think>\n' + choice.message.reasoning_content + '\n</think>\n\n' + fullContent;
           }
-          
+
           return {
             index: choice.index,
             message: {
@@ -228,12 +294,12 @@ app.post('/v1/chat/completions', async (req, res) => {
           total_tokens: 0
         }
       };
-      
+
       res.json(openaiResponse);
     }
-    
+
   } catch (error) {
-    console.error('Proxy error:', error.message);
+    console.error('Proxy error:', error.message, error.response?.data ? JSON.stringify(error.response.data) : '');
 
     // 🔧 FIX: identificar timeout explicitamente (antes caía tudo em 500 genérico)
     const isTimeout = error.code === 'ECONNABORTED' || error.message?.includes('timeout');
@@ -243,7 +309,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       error: {
         message: isTimeout
           ? `Request to NIM API timed out after ${NIM_REQUEST_TIMEOUT}ms`
-          : (error.message || 'Internal server error'),
+          : (error.response?.data?.error?.message || error.message || 'Internal server error'),
         type: 'invalid_request_error',
         code: status
       }
@@ -268,4 +334,5 @@ app.listen(PORT, () => {
   console.log(`Reasoning display: ${SHOW_REASONING ? 'ENABLED' : 'DISABLED'}`);
   console.log(`Thinking mode: ${ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'}`);
   console.log(`Request timeout: ${NIM_REQUEST_TIMEOUT}ms`);
+  console.log(`Max retries per model: ${NIM_MAX_RETRIES}`);
 });
