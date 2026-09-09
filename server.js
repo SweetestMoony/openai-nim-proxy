@@ -128,9 +128,20 @@ async function callNimWithRetry(nimRequest, { stream }) {
       const isRetryable = status ? RETRYABLE_STATUSES.has(status) : true; // erro de rede/timeout também tenta de novo
       const isLastAttempt = attempt === NIM_MAX_RETRIES;
 
+      // 🆕 Muita API que devolve corpo genérico tipo {status,title} (RFC7807) manda
+      // o detalhe de quota nos HEADERS em vez do body. Logar isso ajuda a entender
+      // um 429 "vazio" como o que a NVIDIA está mandando pro kimi-k3.
+      const relevantHeaders = ['retry-after', 'x-ratelimit-limit', 'x-ratelimit-remaining', 'x-ratelimit-reset'];
+      const headers = error.response?.headers || {};
+      const headerInfo = relevantHeaders
+        .filter((h) => headers[h] !== undefined)
+        .map((h) => `${h}=${headers[h]}`)
+        .join(', ');
+
       console.error(
         `NIM call failed (model=${nimRequest.model}, attempt=${attempt + 1}/${NIM_MAX_RETRIES + 1}, status=${status || 'n/a'}):`,
-        error.response?.data ? JSON.stringify(error.response.data) : error.message
+        error.response?.data ? JSON.stringify(error.response.data) : error.message,
+        headerInfo ? `| headers: ${headerInfo}` : '| sem headers de rate limit na resposta'
       );
 
       if (!isRetryable || isLastAttempt) {
