@@ -28,6 +28,11 @@ const ENABLE_THINKING_MODE = false; // Set to true to enable chat_template_kwarg
 // quando um modelo está sobrecarregado ou lento, ex: Deep4 Pro)
 const NIM_REQUEST_TIMEOUT = parseInt(process.env.NIM_REQUEST_TIMEOUT_MS || '120000', 10); // 120s default
 
+// 🆕 Configuração de retry para erros transitórios da NIM
+const NIM_MAX_RETRIES = parseInt(process.env.NIM_MAX_RETRIES || '3', 10);
+const NIM_RETRY_BASE_DELAY_MS = parseInt(process.env.NIM_RETRY_BASE_DELAY_MS || '1000', 10);
+const RETRYABLE_STATUSES = new Set([410, 429, 500, 502, 503, 504]);
+
 // Model mapping (adjust based on available NIM models)
 const MODEL_MAPPING = {
   'llama3': 'meta/llama-3.3-70b-instruct',
@@ -39,7 +44,7 @@ const MODEL_MAPPING = {
 };
 
 // 🆕 Estado simples de saúde por modelo, só pra observabilidade via /health
-const modelHealth = {}; // { [nimModelId]: { failures: number, lastStatus: number|null, lastFailureAt: string|null } }
+const modelHealth = {}; // { [nimModelId]: { failures: number, lastStatus: number|string|null, lastFailureAt: string|null } }
 
 function recordModelFailure(nimModelId, status) {
   if (!modelHealth[nimModelId]) {
@@ -56,33 +61,94 @@ function recordModelSuccess(nimModelId) {
   }
 }
 
-// Chamada única à NIM API (sem retry). Loga status + corpo do erro quando falha.
-async function callNim(nimRequest, { stream }) {
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// 🆕 Lê um stream Node inteiro pra string.
+function readStreamToString(stream) {
+  return new Promise((resolve, reject) => {
+    let raw = '';
+    stream.on('data', (chunk) => { raw += chunk.toString(); });
+    stream.on('end', () => resolve(raw));
+    stream.on('error', reject);
+  });
+}
+
+// 🆕 CRÍTICO: quando a request usa responseType 'stream' (porque o cliente pediu
+// stream:true), uma resposta de ERRO (4xx/5xx) da NIM TAMBÉM chega como um stream
+// não consumido em error.response.data. Sem isso, JSON.stringify(error.response.data)
+// só mostra o objeto interno do Node (_readableState, _events, etc), escondendo
+// completamente a mensagem de erro real que a NVIDIA mandou.
+async function normalizeErrorResponseData(error) {
+  const data = error.response?.data;
+  const isUnreadStream = data && typeof data.pipe === 'function' && typeof data.on === 'function';
+  if (!isUnreadStream) return;
+
+  try {
+    const raw = await readStreamToString(data);
+    try {
+      error.response.data = raw ? JSON.parse(raw) : null;
+    } catch {
+      error.response.data = raw; // corpo não era JSON, guarda como texto mesmo
+    }
+  } catch (readErr) {
+    console.error('Falha ao ler stream de erro da NIM API:', readErr.message);
+  }
+}
+
+// 🆕 Chamada à NIM API com retry/backoff para erros transitórios (410/429/5xx)
+async function callNimWithRetry(nimRequest, { stream }) {
   const headers = {
     Authorization: `Bearer ${NIM_API_KEY}`,
     'Content-Type': 'application/json'
   };
 
-  try {
-    const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
-      headers,
-      responseType: stream ? 'stream' : 'json',
-      // 🔧 FIX: por padrão o Axios limita o corpo enviado/recebido.
-      maxBodyLength: 64 * 1024 * 1024,
-      maxContentLength: 64 * 1024 * 1024,
-      timeout: NIM_REQUEST_TIMEOUT
-    });
-    recordModelSuccess(nimRequest.model);
-    return response;
-  } catch (error) {
-    const status = error.response?.status;
-    recordModelFailure(nimRequest.model, status || 'network_error');
-    console.error(
-      `NIM call failed (model=${nimRequest.model}, status=${status || 'n/a'}):`,
-      error.response?.data ? JSON.stringify(error.response.data) : error.message
-    );
-    throw error;
+  let lastError;
+
+  for (let attempt = 0; attempt <= NIM_MAX_RETRIES; attempt++) {
+    try {
+      const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
+        headers,
+        responseType: stream ? 'stream' : 'json',
+        // 🔧 FIX: por padrão o Axios limita o corpo enviado/recebido.
+        maxBodyLength: 64 * 1024 * 1024,
+        maxContentLength: 64 * 1024 * 1024,
+        timeout: NIM_REQUEST_TIMEOUT
+      });
+      recordModelSuccess(nimRequest.model);
+      return response;
+    } catch (error) {
+      await normalizeErrorResponseData(error); // 🆕 essencial antes de logar/inspecionar
+
+      lastError = error;
+      const status = error.response?.status;
+      recordModelFailure(nimRequest.model, status || 'network_error');
+
+      const isRetryable = status ? RETRYABLE_STATUSES.has(status) : true; // erro de rede/timeout também tenta de novo
+      const isLastAttempt = attempt === NIM_MAX_RETRIES;
+
+      console.error(
+        `NIM call failed (model=${nimRequest.model}, attempt=${attempt + 1}/${NIM_MAX_RETRIES + 1}, status=${status || 'n/a'}):`,
+        error.response?.data ? JSON.stringify(error.response.data) : error.message
+      );
+
+      if (!isRetryable || isLastAttempt) {
+        throw error;
+      }
+
+      const retryAfterHeader = error.response?.headers?.['retry-after'];
+      const backoff = retryAfterHeader
+        ? Number(retryAfterHeader) * 1000
+        : NIM_RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+      const jitter = Math.random() * 300;
+
+      console.warn(`Retentando em ${Math.round(backoff + jitter)}ms...`);
+      await sleep(backoff + jitter);
+    }
   }
+
+  throw lastError;
 }
 
 // Health check endpoint
@@ -93,6 +159,7 @@ app.get('/health', (req, res) => {
     reasoning_display: SHOW_REASONING,
     thinking_mode: ENABLE_THINKING_MODE,
     request_timeout_ms: NIM_REQUEST_TIMEOUT,
+    max_retries: NIM_MAX_RETRIES,
     model_health: modelHealth
   });
 });
@@ -159,7 +226,9 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream: stream || false
     };
 
-    const response = await callNim(nimRequest, { stream: !!stream });
+    // Faz a chamada com retry/backoff para erros transitórios (410/429/5xx).
+    // Sem fallback de modelo: se esgotar as tentativas, o erro é propagado como está.
+    const response = await callNimWithRetry(nimRequest, { stream: !!stream });
 
     if (stream) {
       // Handle streaming response with reasoning
@@ -265,6 +334,8 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
 
   } catch (error) {
+    await normalizeErrorResponseData(error); // 🆕 garante que error.response.data é texto/JSON, não um stream cru
+
     console.error('Proxy error:', error.message, error.response?.data ? JSON.stringify(error.response.data) : '');
 
     // 🔧 FIX: identificar timeout explicitamente (antes caía tudo em 500 genérico)
@@ -300,5 +371,5 @@ app.listen(PORT, () => {
   console.log(`Reasoning display: ${SHOW_REASONING ? 'ENABLED' : 'DISABLED'}`);
   console.log(`Thinking mode: ${ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'}`);
   console.log(`Request timeout: ${NIM_REQUEST_TIMEOUT}ms`);
-
+  console.log(`Max retries per model: ${NIM_MAX_RETRIES}`);
 });
