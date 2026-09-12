@@ -26,7 +26,7 @@ const ENABLE_THINKING_MODE = false; // Set to true to enable chat_template_kwarg
 
 // 🔧 FIX: timeout para chamadas à NIM API (evita requests pendurados indefinidamente
 // quando um modelo está sobrecarregado ou lento, ex: Deep4 Pro)
-const NIM_REQUEST_TIMEOUT = parseInt(process.env.NIM_REQUEST_TIMEOUT_MS || '120000', 10); // 120s default
+const NIM_REQUEST_TIMEOUT = parseInt(process.env.NIM_REQUEST_TIMEOUT_MS || '300000', 10); // 300s default
 
 // Model mapping (adjust based on available NIM models)
 const MODEL_MAPPING = {
