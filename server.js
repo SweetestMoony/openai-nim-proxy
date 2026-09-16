@@ -14,6 +14,13 @@ app.use(cors());
 app.use(express.json({ limit: '64mb' }));
 app.use(express.urlencoded({ limit: '64mb', extended: true }));
 
+// 🆕 Log de todas as requisições que chegam (ajuda a confirmar se o Janitor
+// está realmente alcançando o proxy)
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+  next();
+});
+
 // NVIDIA NIM API configuration
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
@@ -23,6 +30,10 @@ const SHOW_REASONING = false; // Set to true to show reasoning with <think> tags
 
 // 🔥 THINKING MODE TOGGLE - Enables thinking for specific models that support it
 const ENABLE_THINKING_MODE = false; // Set to true to enable chat_template_kwargs thinking parameter
+
+// 🔥 REASONING EFFORT - Controla o quanto o modelo "pensa" antes de responder
+// ('low' | 'high' | 'max') — 'max' é o padrão da NVIDIA e o mais lento
+const REASONING_EFFORT = 'high';
 
 // 🔧 FIX: timeout para chamadas à NIM API (evita requests pendurados indefinidamente
 // quando um modelo está sobrecarregado ou lento, ex: Deep4 Pro)
@@ -139,6 +150,7 @@ app.get('/health', (req, res) => {
     service: 'OpenAI to NVIDIA NIM Proxy',
     reasoning_display: SHOW_REASONING,
     thinking_mode: ENABLE_THINKING_MODE,
+    reasoning_effort: REASONING_EFFORT,
     request_timeout_ms: NIM_REQUEST_TIMEOUT,
     model_health: modelHealth
   });
@@ -202,6 +214,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       messages: messages,
       temperature: temperature || 0.6,
       max_tokens: max_tokens || 9024,
+      reasoning_effort: REASONING_EFFORT, // 🔧 controla o tempo de "pensamento" do modelo
       extra_body: ENABLE_THINKING_MODE ? { chat_template_kwargs: { thinking: true } } : undefined,
       stream: stream || false
     };
@@ -349,5 +362,6 @@ app.listen(PORT, () => {
   console.log(`Health check: http://localhost:${PORT}/health`);
   console.log(`Reasoning display: ${SHOW_REASONING ? 'ENABLED' : 'DISABLED'}`);
   console.log(`Thinking mode: ${ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'}`);
+  console.log(`Reasoning effort: ${REASONING_EFFORT}`);
   console.log(`Request timeout: ${NIM_REQUEST_TIMEOUT}ms`);
 });
